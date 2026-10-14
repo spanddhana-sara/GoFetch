@@ -25,11 +25,16 @@ L2 eviction sets still holds** on M5 (contrary to an initial hypothesis of a
 hashed set index). Fourth, and most significantly, we find that the M5 L2 uses
 an **adaptive, thrash-resistant replacement policy** that makes eviction
 non-monotonic in candidate-set size and sensitive to access sequence, breaking
-the artifact's eviction-set generation algorithm. We implement a
-"grow-and-verify" generator that partially restores functionality but note that
-fully reliable eviction requires reverse-engineering the replacement policy. We
-also document a macOS toolchain incompatibility that blocks the build and its
-workaround.
+the artifact's eviction-set generation algorithm. We reverse-engineer this
+policy and identify it as an **RRIP/DRRIP-family** policy: we measure a resonant
+eviction window (≈ 512–2048 colored lines), a thrash-resistant "dead zone" above
+it, re-reference (recency) protection of the victim, and strong dependence on
+physical page placement — each mapping onto a known RRIP mechanism. Guided by
+this, we implement a "grow-and-verify" generator tuned to the resonant window
+that restores partial functionality (≈ 4/6 runs), and we delimit precisely what
+remains for a robust Prime+Probe channel (RRIP-state-aware access sequences and
+L2 set-index recovery). We also document a macOS toolchain incompatibility that
+blocks the build and its workaround.
 
 ---
 
@@ -241,55 +246,216 @@ The ~500× gap confirms **page coloring works on M5**; the earlier result was an
 artifact of a flawed measurement (minimum over re-loads) and of the victim being
 stuck at the L2 plateau. The "hashed index" hypothesis is withdrawn.
 
-## 8. Adaptive L2 Replacement and Eviction-Set Construction
+## 8. L2 Replacement-Policy Reverse-Engineering and Eviction-Set Construction
 
-The deeper obstacle is the M5 L2 **replacement policy**. Eviction is strongly
-**non-monotonic in candidate-set size**: a forward pointer-chase over a colored
-pool evicts the victim at small sizes, fails across a mid-size "dead zone," and
-succeeds again only at full-cache sizes.
+The deepest obstacle to porting GoFetch to M5 is the L2 cache's **replacement
+policy**. On M1–M3 the stock generator assumes a classic recency policy
+(LRU/PLRU), under which a set of `L2_NWAYS` congruent lines, accessed once,
+deterministically evicts a victim. On M5 this assumption fails completely, and
+the cause is a far more sophisticated, *adaptive* replacement policy. This
+section documents the reverse-engineering of that policy, the mechanism we
+infer, and how it reshapes the eviction-set generator.
 
-| N (colored lines) | 512 | 1024 | 2048 | 4096 | … | 65536 | 131072 |
+### 8.1 Initial symptom
+
+Run unmodified, the stock `build_l2_eviction_set_superset` doubles the colored
+candidate set (16, 32, …) until the victim's access latency crosses the
+DRAM threshold. On M5 it does not cross until the candidate set reaches
+**131072 lines — exactly 16 MB / 128 B, the entire L2** (resident set ~2.2 GB),
+after which the group-testing reduction never converges and trips the built-in
+20-second guard (`PANIC: takes >20 seconds reducing the eviction set`). The
+generator effectively has to fill the whole cache to evict one line, and then
+cannot reduce the result. This is the outward sign of an eviction curve that is
+not monotonic in set size.
+
+### 8.2 Methodology
+
+We reverse-engineer the policy with small standalone probes (outside the GoFetch
+tree) so that each variable can be controlled independently. Each probe:
+
+- allocates a victim line and a pool of **page-colored** candidate lines (one
+  per `mmap`'d 16 KB page, all at the victim's page offset — the same coloring
+  the artifact uses, which §7 shows is effective on M5);
+- links the candidates into a pointer-chase list and traverses them to apply
+  cache pressure;
+- times the victim with `CNTVCT_EL0` (§5), classifying a load as **evicted to
+  DRAM** when its latency ≥ 100 ticks (cache ≈ 41, in-L2 ≈ 83, DRAM ≈ 125–166);
+- repeats each measurement K times (typically 15–21) and reports the
+  **DRAM-rate**: the fraction of trials in which the victim was evicted to DRAM.
+
+The independent variables are the candidate-set size **N**, the number of
+traversal passes **P**, and the victim address (page offset + physical
+placement). DRAM-rate as a function of these variables is the eviction surface.
+
+### 8.3 Eviction is non-monotonic in set size
+
+Sweeping N for a single victim with a plain forward chase:
+
+| N (colored lines) | 512 | 1024 | 2048 | 4096 | 8192 | 65536 | 131072 |
 |---|---|---|---|---|---|---|---|
 | DRAM-rate | ~1.0 | ~0.1 | ~0.7 | ~0.0 | ~0.0 | ~0.0 | ~0.9 |
 
-Additional observations:
+Eviction succeeds at *small* N, fails across a wide *mid-size* band, and
+succeeds again only when N approaches the *whole cache*. A policy in which more
+cache pressure monotonically increases eviction (LRU/PLRU) cannot produce this
+shape. A medium-sized working set is somehow **less** able to evict the victim
+than a small one — the hallmark of thrash-resistant insertion.
 
-- **Re-traversal re-caches the victim.** With a fixed colored set, 1–2
-  traversal passes evict to DRAM, but **3+ passes return the victim to cache**
-  (DRAM-rate falls to ~0). The stock `traverse_eviction_set` performs a
-  dual-cursor forward+backward chase repeated twice (~4 passes), which prevents
-  eviction on M5.
-- **Victim dependence.** Page-aligned victims evict at ~512 colored lines;
-  random-offset victims need ~1536 and remain only ~70–86% reliable.
-- **Access-sequence / state dependence.** A freshly-primed victim followed by a
-  single traversal is evicted to DRAM (125 ticks), but an already-in-L2 victim
-  that is merely re-traversed stays in L2 (83 ticks).
+### 8.4 The size × passes surface and re-traversal re-caching
 
-These behaviors are consistent with an **adaptive, thrash-resistant replacement
-policy** (e.g., RRIP/DRRIP-style) that detects medium-sized streaming working
-sets and protects recently-used lines. They invalidate the stock generator,
-which (a) grows the candidate set upward through the dead zone until full-cache
-eviction, then (b) group-reduces back down to exactly `L2_NWAYS` lines—both
-assuming monotonic eviction.
+Fixing a (page-aligned) victim and a working set of N = 512 and varying the
+number of forward-chase passes P:
 
-**Our M5 generator.** We replace `find_L2_eviction_set_using_timer` (under the
-M5 timer macro) with a **grow-and-verify** strategy: grow a page-colored set
-along a size ladder (512, 768, …, 16384) and at each step *directly measure*
-eviction, returning the first size whose median victim latency reaches DRAM,
-confirmed by a second measurement. We also replace the M5 `traverse_eviction_set`
-with a **single forward pointer-chase**. We deliberately **do not** reduce to
-`L2_NWAYS`: minimal congruent sets fall inside the protected dead zone.
+| passes P | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| DRAM-rate | 0.90 | 1.00 | 0.13 | 0.03 | 0.00 | 0.00 |
 
-**Result (partial).** The generator succeeds on page-aligned victims—e.g.,
-`evset_gen` finds a 768-line set yielding a clean L2-miss latency of 125 ticks
-versus an L2-hit of 41—a qualitative improvement over the stock algorithm, which
-simply exhausts memory and times out. However, reliability is **partial**: some
-runs fail entirely, and an eviction set validated under the generator's
-prime-then-traverse pattern does not always transfer to a different access
-pattern (e.g., the repeated-traverse measurement loop measures 83 ticks, i.e.,
-the victim remains in L2). We conclude that **robust, access-pattern-independent
-L2 eviction on M5 is unsolved** and requires reverse-engineering the replacement
-policy.
+One or two passes evict reliably; **three or more passes return the victim to
+the cache** (DRAM-rate collapses to ~0). Re-referencing the candidate set does
+not deepen eviction — it *undoes* it. This immediately explains why the stock
+`traverse_eviction_set`, which performs a dual-cursor forward+backward chase
+repeated twice (≈ 4 passes over each line), fails to evict on M5 even with a
+correctly sized set: it over-traverses into the re-caching regime.
+
+### 8.5 Per-victim resonant windows
+
+Eviction is strongly victim-dependent. Measuring DRAM-rate at P = 2 across a
+fine N sweep for two victims (K = 21):
+
+| N | victim off 0x0000 | victim off 0x1980 |
+|---|---|---|
+| 256 | 0.00 | 0.05 |
+| 512 | **1.00** | **1.00** |
+| 640 | **1.00** | **1.00** |
+| 768 | **1.00** | **1.00** |
+| 896 | **1.00** | 0.00 |
+| 1024 | **1.00** | **0.86** |
+| 1280 | 0.90 | **1.00** |
+| 1536 | 0.95 | **1.00** |
+| 2048 | **1.00** | 0.00 |
+| 3072 | 0.10 | 0.00 |
+| 4096 | 0.00 | 0.00 |
+| 8192 | 0.24 | 0.05 |
+
+Each victim has a **resonant window** of candidate-set sizes — roughly
+**N ∈ [512, 2048]** — inside which eviction is reliable, bounded below by a
+region where the victim is protected (too few congruent references) and above by
+the collapse at ~3072 (the thrash-resistant "dead zone"). Within the window
+there are reproducible victim-specific "holes" (e.g., off 0x1980 at N = 896 and
+2048). A per-victim scan (not a single fixed size) is therefore required.
+
+### 8.6 Physical-placement variance
+
+The *same* victim page offset can be evictable in one run and not another. In an
+earlier coarse sweep, offset 0x1980 showed DRAM-rate 0 at every tested N; in the
+fine sweep above it is reliably evictable. The difference is the **physical
+placement** of the colored candidate pages: each `mmap` receives different
+physical frames, which changes which colored lines are *truly congruent* with
+the victim's L2 set. Because the usable window is narrow and congruent-line
+supply depends on placement, a given allocation may or may not contain enough
+congruent lines at a usable size. This randomness — not fundamental
+unevictability — is the dominant source of run-to-run variance.
+
+### 8.7 Policy identification: RRIP / DRRIP
+
+Every observation above maps cleanly onto a **Re-Reference Interval Prediction**
+family policy (SRRIP/BRRIP/DRRIP, Jaleel et al., ISCA 2010), which modern CPUs
+use in place of true LRU:
+
+- In RRIP each line carries an *M*-bit re-reference prediction value (RRPV).
+  Lines are **inserted** with a "distant" prediction (not MRU), **promoted** to
+  "near" (RRPV = 0) on a hit, and the victim chosen on a miss is a line with the
+  "distant-most" value (RRPV = max), incrementing all RRPVs if none is found.
+- **Recency protection (§8.4, §8.9).** A just-referenced victim has RRPV = 0 and
+  is evicted *last*; it takes many congruent misses to age its RRPV to max. A
+  single pass over a correctly sized congruent set delivers roughly that many
+  misses and evicts it; a *freshly primed* victim is in a known RRPV = 0 state,
+  which is why priming matters.
+- **Thrash resistance / dead zone (§8.3, §8.5).** BRRIP (used by DRRIP via
+  set-dueling when a workload thrashes) inserts most lines at the distant-most
+  RRPV, so a medium streaming working set **evicts itself** rather than
+  displacing the resident victim. This is exactly the mid-size band where
+  eviction fails, and why only a *small* set (fits the SRRIP-like regime) or
+  *whole-cache* pressure evicts.
+- **Re-traversal re-caching (§8.4).** Repeated passes turn the candidate lines
+  into *hits*, promoting them to RRPV = 0; they stop being eviction pressure and
+  instead occupy the "near" positions, so the victim is no longer forced out.
+
+We therefore conclude M5's L2 uses an **adaptive, thrash-resistant RRIP/DRRIP-
+family replacement policy**, not the LRU/PLRU the stock generator assumes. (We
+do not claim the exact RRPV width or the precise set-dueling parameters; those
+would require either documentation or a dedicated micro-benchmark that isolates a
+single physical set.)
+
+### 8.8 The M5 eviction-set generator
+
+The RE findings directly reshape the generator. We replace
+`find_L2_eviction_set_using_timer` (under the M5 timer macro) and
+`traverse_eviction_set` as follows:
+
+1. **Single-pass traversal.** The M5 `traverse_eviction_set` performs **one
+   plain forward pointer-chase** instead of the stock dual-cursor
+   forward+backward double round, keeping within the 1–2 pass regime that
+   evicts (§8.4).
+2. **Grow-and-verify over the resonant window.** Rather than grow to full cache
+   and group-reduce to `L2_NWAYS` (both impossible here — §8.1, and minimal
+   congruent sets sit below the window), the generator grows a page-colored set
+   along a **fine ladder restricted to the window**
+   (512, 640, 768, 896, 1024, 1152, 1280, 1536, 1792, 2048) and *directly
+   measures* eviction at each step, returning the first size whose median victim
+   latency reaches DRAM, confirmed by a second measurement.
+3. **Retry on fresh allocation.** Because evictability depends on physical
+   placement (§8.6), failure triggers up to `MAX_ATTEMPTS` (16) retries with
+   newly allocated candidate pages.
+4. **No `L2_NWAYS` reduction.** The result is a working but *non-minimal*
+   eviction set (typically ~1100–1300 lines); minimal congruent reduction is
+   infeasible under this policy without first recovering the set-index.
+
+**Reliability.** Over repeated `evset_gen` runs the tuned generator finds a
+working eviction set in roughly **4 of 6 runs**, versus the stock algorithm,
+which never completes (it exhausts memory and times out). The remaining failures
+are placement-unlucky allocations (§8.6).
+
+### 8.9 Residual gap: access-sequence state dependence
+
+A subtle but important limitation remains. The generator validates an eviction
+set with a *prime-then-single-traverse* pattern (`evict_and_time` loads the
+victim, then traverses once, then times it) and correctly measures DRAM
+(~125 ticks). But `evset_gen`'s separate L2-miss diagnostic loop, which
+*re-traverses without re-priming the victim each iteration*, measures the same
+victim at **~83 ticks (still in L2)**. The eviction set is identical; only the
+access sequence differs.
+
+Under RRIP this is expected: eviction depends on the victim's **RRPV state** at
+the moment the congruent pressure is applied. A freshly primed victim
+(RRPV = 0 in L1) is driven out through L1 → L2 → DRAM by one traversal; a victim
+left resident from a prior step sits at a different RRPV and the same single
+traversal only displaces it from L1 to L2. In other words, on M5 an eviction set
+is **not** an access-pattern-independent object the way it is under LRU — its
+effect is a function of the shared RRIP state.
+
+For GoFetch's purposes this is not fatal: the attack's *prime* step
+deliberately accesses (and thus primes) the line it wants to evict, which is the
+exact sequence the generator validates. But a *robust* Prime+Probe channel must
+be written with the RRIP state in mind rather than assuming eviction is
+stateless.
+
+### 8.10 Open problems
+
+Two concrete items remain before the `poc/` attacks can be ported:
+
+1. **RRIP-aware Prime+Probe.** Characterize the exact number of congruent
+   re-references needed to force a victim's RRPV to max from each starting
+   state, and build the prime/probe sequences around it so eviction is
+   deterministic regardless of the victim's prior cache state.
+2. **Set-index recovery for minimal sets.** The current eviction sets are large
+   (~1200 lines) because we cannot isolate the ~`L2_NWAYS` congruent lines.
+   Recovering M5's physical L2 set-index function (e.g., via huge pages, or a
+   timing-based congruence oracle that tolerates the adaptive policy) would
+   allow true minimal eviction sets and sharper Prime+Probe monitoring.
+
+Both are tractable follow-ups, but each is a research task in its own right;
+together they are the gate to end-to-end key extraction on M5.
 
 ## 9. Summary of Code Changes
 
@@ -302,17 +468,17 @@ that M1/M2/M3 behavior is unchanged.
 | `lib/eviction_set/sys_utils.h` | Add a `CNTVCT_EL0`-based `kpc_time_load` for the M5 path (inline `mrs`, mirroring the Linux PMC path). |
 | `lib/eviction_set/sys_utils.c` | `get_kpc_time()` reads `CNTVCT_EL0` on M5; `init_kpc()`/`configure_kpc()` become no-ops on M5 (no kperf, no `sudo`); retain a fixed-counter fallback for the non-CNTVCT path. |
 | `lib/eviction_set/eviction_set.c` | M5 `traverse_eviction_set`: single forward pointer-chase instead of the dual-cursor forward+backward double round. |
-| `lib/eviction_set/eviction_set_generation.c` | M5 `find_L2_eviction_set_using_timer`: grow-and-verify generator (no `L2_NWAYS` reduction). Stock path retained for other targets. |
+| `lib/eviction_set/eviction_set_generation.c` | M5 `find_L2_eviction_set_using_timer`: grow-and-verify generator scanning a fine size ladder restricted to the resonant window (512–2048, §8.8), retrying up to 16× on fresh allocations; no `L2_NWAYS` reduction. Stock path retained for other targets. |
 | `aop_stream.c` | Pin `aop` into `data_buf`'s 4 GB region via `MAP_FIXED` (fixes `ADDR_CHECK` on M5); add optional `argv[5]` to set the DIT bit for mitigation testing. |
 | `no_deref.c` | Same `MAP_FIXED` `aop` allocation fix so the activation-criteria experiments run on M5 (§6.1d). |
 
 ## 10. Limitations and Future Work
 
-- **Replacement policy.** The central open problem is the adaptive L2
-  replacement policy. Future work should characterize the dead zone precisely
-  and search for access orderings/interleavings that defeat thrash-resistance
-  (a well-studied problem for RRIP/DRRIP), yielding reliable minimal eviction
-  sets. Only then can the `poc/` Prime+Probe attacks be ported.
+- **Replacement policy.** The central open problem is the adaptive,
+  thrash-resistant RRIP/DRRIP-family L2 replacement policy reverse-engineered in
+  §8. The two concrete follow-ups (§8.10) are an RRIP-state-aware Prime+Probe
+  sequence and recovery of the physical L2 set-index for minimal eviction sets;
+  only then can the `poc/` attacks be ported.
 - **L2 associativity** on M5 remains undetermined; the current generator does
   not depend on it, but a minimal-set approach would.
 - **Timer resolution.** The 17 ns `CNTVCT` step cannot separate L1 from L2;

@@ -210,11 +210,18 @@ void reduce_l2_eviction_set_superset(cache_line_set_t* eviction_set_superset, ui
 // ladder size evicts this victim (caller should retry with a fresh victim).
 cache_line_set_t* find_L2_eviction_set_using_timer(uint8_t* victim_addr) {
     uint64_t page_offset = (uint64_t)victim_addr % PAGE_SIZE;
+    // Reverse-engineering of the M5 L2 replacement policy (see M5 port report
+    // section on adaptive replacement) found a "resonant" eviction window of
+    // roughly 512-2048 colored lines: below it the recently-used victim is
+    // protected, above ~2048-3072 thrash-resistant insertion collapses eviction
+    // (the "dead zone"). Whether a given size evicts within the window depends
+    // on the random physical placement of the colored pages, so we scan the
+    // window in fine steps and, on failure, retry with freshly allocated pages.
     static const int sizes[] = {
-        512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384
+        512, 640, 768, 896, 1024, 1152, 1280, 1536, 1792, 2048
     };
     const int nsizes = sizeof(sizes) / sizeof(sizes[0]);
-    const int MAX_ATTEMPTS = 8;
+    const int MAX_ATTEMPTS = 16;
 
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         allocator_t *allocator = create_allocator(page_offset, PAGE_SIZE);
