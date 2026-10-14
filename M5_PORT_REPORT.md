@@ -163,7 +163,66 @@ A prerequisite fix was required: the experiments `mmap` a ~1 GB `data_buf` and a
 small `aop` with `NULL` address hints, which land in **different 4 GB regions**
 on M5/macOS, violating the DMP's same-region requirement (`ADDR_CHECK`). We pin
 `aop` immediately after `data_buf` with `MAP_FIXED` so both share one 4 GB
-window.
+window (applied in both `aop_stream.c` and `no_deref.c`).
+
+### 6.1 Detailed DMP Characterization
+
+Beyond presence, we characterized the DMP's activation and dereferencing
+behavior on M5 using the `aop_stream` (Augury) and `addr_sweep` experiments.
+Each configuration was run repeatedly; we report the fraction of runs in which
+the pointed-to line came back cached (median latency < 100 ticks, i.e. the DMP
+dereferenced the pointer). All measurements use `CNTVCT_EL0` (§5) and need no
+privilege.
+
+**(a) Activation vs. training length.** Varying the number of architecturally
+dereferenced training pointers in a 264-entry `aop` (measuring the first
+out-of-bounds pointer), the DMP dereferences reliably across a wide range:
+
+| training length | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| ATK cached (of 8 runs) | 8 | 0 | 7 | 8 | 8 | 4 | 8 |
+
+Activation is robust from very short training onward; the dips at 8 and 128 are
+reproducible outliers (likely set-aliasing at those specific sizes) rather than
+a threshold.
+
+**(b) Prefetch depth.** With a 256-entry training prefix and 16 out-of-bounds
+pointers, we measured each out-of-bounds index individually. The DMP
+dereferences deeply—indices +0 through +15 were cached in 6–8 of 8 runs
+(most at 8/8)—confirming the Augury multi-pointer dereference behavior persists
+on M5.
+
+**(c) 4 GB-region restriction.** Using `addr_sweep` to place a pointer and its
+target at candidate addresses on a fixed 256 MB stride across a 4 GB boundary,
+we classified each pair by whether the pointer's location and its target share
+a 4 GB region:
+
+| pair type | cached (DMP dereferenced) |
+|---|---|
+| **same 4 GB region** | **74 / 74 (100%)** |
+| **cross 4 GB region** | **1 / 88 (1%)** |
+
+The DMP dereferences a pointer **only** when its location and target lie in the
+same 4 GB region—a precise match to the M1–M3 behavior the attack relies on.
+
+**(d) Divergence: activation without architectural dereference.** The `no_deref`
+experiments—where candidate pointer *values* are loaded into L1 but never
+architecturally dereferenced (via `datastream_array`)—reproduce the M1–M3
+claims only weakly on M5. Across 12 runs each, the pointed-to line came back
+cached in just 1/12 (in-bounds pointers, all touched), 3/12 (single touch, same
+L1 line), and 2/12 (stride-prefetcher-fed) configurations, with ATK and BASE
+medians largely overlapping. In contrast, every experiment that performs real
+architectural dereferences (`aop_stream`, `addr_sweep`) yields a clean signal.
+This suggests **M5's DMP has stricter activation criteria than M1–M3**: it keys
+on genuine dereference activity rather than triggering readily on
+pointer-valued loads or stride-prefetched lines. The top-byte-ignore (TBI)
+experiment is built on the `no_deref` path and was therefore too noisy to
+yield a conclusion on M5; we leave it to future work on the cleaner path.
+
+**Summary.** M5's DMP matches the paper's M1–M3 model on the properties the
+attack exploits (presence, deep out-of-bounds dereferencing, the 4 GB-region
+restriction, DIT suppression), and diverges only in being less easily activated
+without architectural dereferences.
 
 ## 7. L2 Cache Addressing: Page Coloring Holds
 
@@ -245,6 +304,7 @@ that M1/M2/M3 behavior is unchanged.
 | `lib/eviction_set/eviction_set.c` | M5 `traverse_eviction_set`: single forward pointer-chase instead of the dual-cursor forward+backward double round. |
 | `lib/eviction_set/eviction_set_generation.c` | M5 `find_L2_eviction_set_using_timer`: grow-and-verify generator (no `L2_NWAYS` reduction). Stock path retained for other targets. |
 | `aop_stream.c` | Pin `aop` into `data_buf`'s 4 GB region via `MAP_FIXED` (fixes `ADDR_CHECK` on M5); add optional `argv[5]` to set the DIT bit for mitigation testing. |
+| `no_deref.c` | Same `MAP_FIXED` `aop` allocation fix so the activation-criteria experiments run on M5 (§6.1d). |
 
 ## 10. Limitations and Future Work
 

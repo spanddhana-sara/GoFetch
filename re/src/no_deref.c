@@ -54,12 +54,17 @@ int main(int argc, char** argv) {
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("[+] data_buf_addr: %p\n", data_buf_addr);
 
-    // Allocate memory for aop array
+    // Allocate memory for aop array.
+    // aop and data_buf must share one 4 GB region for the DMP to dereference
+    // (ADDR_CHECK). On M5/macOS the default NULL-hint layout separates them, so
+    // pin aop just past data_buf, inside its 4 GB window, with MAP_FIXED.
     char victim_size_str[10];
     return_size(victim_size_str, victim_size*sizeof(uint64_t));
-    uint64_t* aop_addr = 
-        mmap(NULL, victim_size*sizeof(uint64_t), PROT_READ | PROT_WRITE, 
-        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *aop_hint = (void *)(((uintptr_t)data_buf_addr + SIZE_DATA_ARRAY
+                               + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
+    uint64_t* aop_addr =
+        mmap(aop_hint, victim_size*sizeof(uint64_t), PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     printf("[+] aop_addr: %p\n", aop_addr);
     assert(ADDR_CHECK((uintptr_t)data_buf_addr, (uintptr_t)aop_addr));
 
