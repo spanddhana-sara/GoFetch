@@ -192,6 +192,58 @@ void reduce_l2_eviction_set_superset(cache_line_set_t* eviction_set_superset, ui
     }
 }
 
+#ifdef USE_CNTVCT_TIMER
+// --- M5 L2 eviction-set generator ---------------------------------------
+// M5's L2 uses an adaptive, thrash-resistant replacement policy: eviction is
+// NON-monotonic in candidate-set size (small page-colored sets evict, a
+// mid-size "dead zone" does not, full-cache thrash evicts again) and is
+// victim-dependent. The stock algorithm (grow to full cache, then group-reduce
+// to L2_NWAYS) can't work here -- it sweeps through the dead zone in both
+// directions, and no minimal L2_NWAYS set survives.
+//
+// Instead, grow a page-colored candidate set along a ladder of sizes and
+// DIRECTLY measure eviction at each step, returning the first size that
+// evicts the victim to DRAM (median latency >= L2_MISS_MIN_LATENCY), confirmed
+// by a second measurement. The result is a WORKING but non-minimal eviction
+// set. Reducing it to exactly L2_NWAYS congruent lines needs the replacement
+// policy reverse-engineered first; see the M5 port notes. Returns NULL if no
+// ladder size evicts this victim (caller should retry with a fresh victim).
+cache_line_set_t* find_L2_eviction_set_using_timer(uint8_t* victim_addr) {
+    uint64_t page_offset = (uint64_t)victim_addr % PAGE_SIZE;
+    static const int sizes[] = {
+        512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384
+    };
+    const int nsizes = sizeof(sizes) / sizeof(sizes[0]);
+    const int MAX_ATTEMPTS = 8;
+
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        allocator_t *allocator = create_allocator(page_offset, PAGE_SIZE);
+        cache_line_set_t *set = build_empty_cache_line_set(allocator);
+
+        for (int si = 0; si < nsizes; si++) {
+            while (set->num_cache_lines < sizes[si])
+                push_cache_line_to_set(set, pop_cache_line_from_allocator(allocator));
+
+            int t1 = evict_and_time(victim_addr, set);
+            if (t1 >= L2_MISS_MIN_LATENCY) {
+                int t2 = evict_and_time(victim_addr, set); // confirm stability
+                if (t2 >= L2_MISS_MIN_LATENCY) {
+                    printf("[M5] L2 eviction set found: %ld colored lines, "
+                           "victim latency = %d/%d ticks (attempt %d)\n",
+                           set->num_cache_lines, t1, t2, attempt);
+                    return set;
+                }
+            }
+        }
+        printf("[M5] attempt %d: no ladder size evicted victim; retrying\n", attempt);
+        // Intentionally do not free: allocator pages back the candidate lines;
+        // a fresh attempt uses new distinct pages.
+    }
+    fprintf(stderr, "[M5] FAILED to build an L2 eviction set after %d attempts\n",
+            MAX_ATTEMPTS);
+    return NULL;
+}
+#else
 cache_line_set_t* find_L2_eviction_set_using_timer(uint8_t* victim_addr) {
 
     cache_line_set_t* evset_cache_lines;
@@ -215,5 +267,6 @@ cache_line_set_t* find_L2_eviction_set_using_timer(uint8_t* victim_addr) {
 
     return evset_cache_lines;
 }
+#endif
 
 

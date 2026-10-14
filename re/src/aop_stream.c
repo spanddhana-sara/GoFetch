@@ -1,4 +1,5 @@
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <assert.h>
 #include "dmp.h"
@@ -15,6 +16,7 @@ int main(int argc, char** argv) {
     argv[2]: size of the victim array
     argv[3]: training length
     argv[4]: test ptr idx
+    argv[5]: (optional) set DIT bit: 1 = set, 0/absent = leave cleared
     */
     // read arguments
     int core_id;
@@ -25,6 +27,17 @@ int main(int argc, char** argv) {
     sscanf(argv[3], "%d", &training_length);
     int test_idx;
     sscanf(argv[4], "%d", &test_idx);
+    int set_dit = (argc > 5) ? atoi(argv[5]) : 0;
+
+    // Optionally enable Data Independent Timing, Apple's documented DMP
+    // mitigation. If the DMP honors DIT on M5, the ATK signal should collapse
+    // to match BASE (no prefetch of the pointed-to data).
+    if (set_dit) {
+        int has_dit = 0; size_t sz = sizeof(has_dit);
+        sysctlbyname("hw.optional.arm.FEAT_DIT", &has_dit, &sz, NULL, 0);
+        if (has_dit) { __builtin_arm_wsr64("DIT", 1); printf("[+] DIT set\n"); }
+        else printf("[+] DIT not supported\n");
+    }
 
     // pin to core
     pin_cpu((size_t)core_id);
@@ -39,12 +52,19 @@ int main(int argc, char** argv) {
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("[+] data_buf_addr: %p\n", data_buf_addr);
 
-    // Allocate memory for aop array
+    // Allocate memory for aop array.
+    // The aop (where secret-dependent pointers live) and data_buf (their
+    // targets) must share the same 4 GB region for the DMP to dereference them
+    // (see ADDR_CHECK). On M5/macOS the default mmap layout places a small
+    // NULL-hint mapping far from the ~1 GB data_buf, so pin the aop right after
+    // data_buf, inside its 4 GB window, with MAP_FIXED.
     char victim_size_str[10];
     return_size(victim_size_str, victim_size*sizeof(uint64_t));
-    uint64_t* aop_addr = 
-        mmap(NULL, victim_size*sizeof(uint64_t), PROT_READ | PROT_WRITE, 
-        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *aop_hint = (void *)(((uintptr_t)data_buf_addr + SIZE_DATA_ARRAY
+                               + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
+    uint64_t* aop_addr =
+        mmap(aop_hint, victim_size*sizeof(uint64_t), PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     printf("[+] aop_addr: %p\n", aop_addr);
     assert(ADDR_CHECK((uintptr_t)data_buf_addr, (uintptr_t)aop_addr));
 

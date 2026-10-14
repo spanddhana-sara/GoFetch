@@ -72,6 +72,19 @@ uint8_t traverse_eviction_set(eviction_set_t *eviction_set) {
     node_t* tail = eviction_set->list_of_cachelines->tail;
     int num_nodes = eviction_set->list_of_cachelines->num_nodes;
 
+#ifdef USE_CNTVCT_TIMER
+    // M5 path: a SINGLE plain forward pointer-chase. M5's L2 replacement policy
+    // re-caches a recently-used victim under heavy re-traversal, so the stock
+    // dual-cursor forward+backward chase (2 rounds, ~4 passes) fails to evict.
+    // A single forward pass is the measured sweet spot for eviction here.
+    {
+        volatile node_t *iter = head;
+        while (iter) iter = iter->next;
+        asm volatile("dsb sy\n\t");
+        return 0;
+    }
+#endif
+
     for (int i = 0; i < 2; i++) {
         // Perform a forward traversal over two linked lists with one cursor
         // lagging behind n steps to perform dual-chasing

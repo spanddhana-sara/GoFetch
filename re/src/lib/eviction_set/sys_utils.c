@@ -122,13 +122,32 @@ KPERF_LIST
 uint64_t g_counters[COUNTERS_COUNT];
 uint64_t g_config[COUNTERS_COUNT];
 
+// Index into g_counters that holds the core-cycle count used as our timer.
+// The thread-counter array is laid out as [fixed counters..., configurable
+// counters...]. Originally GoFetch configured CPMU_CORE_CYCLE on the first
+// *configurable* counter and read it at index 2 (= 2 fixed counters ahead of
+// it). On newer macOS (observed on M5 / macOS 26-27) kpc_set_config is blocked
+// with EPERM, so the configurable counters cannot be programmed. The two fixed
+// counters, however, are always-on and need no config: fixed counter 0 is the
+// core-cycle count -- exactly the timer we need. So when set_config is denied
+// we fall back to reading the fixed cycle counter at index 0.
+static int g_cycle_counter_idx = 2;
+
 void configure_kpc(void)
 {
+#ifdef USE_CNTVCT_TIMER
+    // M5/macOS: timing uses CNTVCT_EL0 directly; no PMC configuration needed.
+    return;
+#else
     g_config[0] = CPMU_CORE_CYCLE | CFGWORD_EL0A64EN_MASK;
     if (kpc_set_config(KPC_MASK, g_config))
     {
-        printf("kpc_set_config failed\n");
-        return;
+        // Configurable PMCs are not programmable here (newer macOS denies this
+        // with EPERM). Fall back to the always-on fixed cycle counter and keep
+        // going -- arming the fixed counters below is still necessary.
+        printf("kpc_set_config failed (EPERM expected on newer macOS); "
+               "using fixed cycle counter (index 0)\n");
+        g_cycle_counter_idx = 0;
     }
 
     if (kpc_force_all_ctrs_set(1))
@@ -148,10 +167,15 @@ void configure_kpc(void)
         printf("kpc_set_thread_counting failed\n");
         return;
     }
+#endif // USE_CNTVCT_TIMER
 }
 
 void init_kpc(void)
 {
+#ifdef USE_CNTVCT_TIMER
+    // M5/macOS: no kperf framework needed when timing via CNTVCT_EL0.
+    return;
+#else
     void *kperf = dlopen(
         "/System/Library/PrivateFrameworks/kperf.framework/Versions/A/kperf",
         RTLD_LAZY);
@@ -169,16 +193,25 @@ void init_kpc(void)
     }
     KPERF_LIST
 #undef F
+#endif // USE_CNTVCT_TIMER
 }
 
 uint64_t get_kpc_time(void)
 {
+#ifdef USE_CNTVCT_TIMER
+    // M5/macOS: unprivileged generic timer. ~17 ns effective step; coarse but
+    // cleanly separates cache-resident from DRAM accesses.
+    uint64_t t;
+    asm volatile("mrs %0, CNTVCT_EL0" : "=r"(t));
+    return t;
+#else
     if (kpc_get_thread_counters(0, COUNTERS_COUNT, g_counters))
     {
         printf("kpc_get_thread_counters failed\n");
         return 1;
     }
-    return g_counters[2];
+    return g_counters[g_cycle_counter_idx];
+#endif
 }
 
 void pin_cpu(size_t core_no)

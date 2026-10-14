@@ -51,6 +51,20 @@ void return_size(char* output, size_t bytes);
             : [victim_addr] "r" (addr) \
             : "x9", "x10"); \
 })
+#elif defined(USE_CNTVCT_TIMER)
+// macOS/M5: time the load with the unprivileged generic timer CNTVCT_EL0,
+// mirroring the Linux inline-mrs path (no kperf framework call in the hot loop).
+#define kpc_time_load(addr, latency, junk) ({\
+    uint64_t _cnt_t0, _cnt_t1; \
+    MEM_BARRIER; \
+    asm volatile("mrs %0, CNTVCT_EL0" : "=r" (_cnt_t0)); \
+    INST_SYNC; \
+    mem_access(addr, junk); \
+    INST_SYNC; \
+    asm volatile("mrs %0, CNTVCT_EL0" : "=r" (_cnt_t1)); \
+    MEM_BARRIER; \
+    latency = _cnt_t1 - _cnt_t0; \
+})
 #else
 #define kpc_time_load(addr, latency, junk) ({\
     MEM_BARRIER; \
